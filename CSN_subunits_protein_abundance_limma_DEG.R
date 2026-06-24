@@ -6,6 +6,10 @@
 ##    For each CPTAC dataset and each CSN subunit, use the subunit's protein
 ##    abundance as a continuous predictor in limma to perform genome-wide
 ##    Differentially Expressed Protein (DEP) analysis across the proteome.
+##    Additionally includes CSN_SCORE (PCA PC1 of z-scored CSN subunits,
+##    with COPS7A/7B combined) as a composite predictor, and resid_*
+##    predictors (individual subunit with CSN_SCORE partialled out as an
+##    additional covariate) to isolate each subunit's unique contribution.
 ##
 ##  Statistical rationale:
 ##    Using a continuous predictor in limma is a well-established approach
@@ -221,6 +225,129 @@ get_tp53_sample_lists <- function(ds_id, tp53_dir = TP53_DIR) {
   )
 }
 
+# ---- 4b. Helpers: CSN_SCORE computation (PCA PC1 of z-scored subunits) ---
+
+## Clean matrix for PCA: remove rows with too few finite values, impute
+## remaining NAs with row medians
+.clean_for_pca <- function(X, min_samples = 10L, min_genes = 5L) {
+  X <- as.matrix(X)
+  X[!is.finite(X)] <- NA
+  keep_rows <- rowSums(is.finite(X)) >= min_samples
+  if (!any(keep_rows)) {
+    return(NULL)
+  }
+  X <- X[keep_rows, , drop = FALSE]
+  if (nrow(X) < min_genes) {
+    return(NULL)
+  }
+  if (anyNA(X)) {
+    med <- apply(X, 1, function(r) median(r[is.finite(r)], na.rm = TRUE))
+    for (i in seq_len(nrow(X))) {
+      xi <- X[i, ]
+      xi[!is.finite(xi)] <- med[i]
+      X[i, ] <- xi
+    }
+  }
+  X
+}
+
+## Perform PCA using the cross-sample z-values of subunits, and take PC1
+## as the CSN score; adjust direction to have the same sign as the mean z.
+build_csn_score <- function(mat0,
+                            subunits = CSN_SUBUNITS,
+                            combine_7AB = TRUE,
+                            min_members = 5L) {
+  present <- intersect(subunits, rownames(mat0))
+  # Pre-create the return skeleton
+  s <- setNames(rep(NA_real_, ncol(mat0)), colnames(mat0))
+  if (!length(present)) {
+    return(s)
+  }
+
+  # z-score (preserve sample names)
+  get_z <- function(v) {
+    nm <- names(v)
+    v <- as.numeric(v)
+    mu <- mean(v[is.finite(v)], na.rm = TRUE)
+    sdv <- stats::sd(v[is.finite(v)], na.rm = TRUE)
+    if (!is.finite(sdv) || sdv == 0) sdv <- 1
+    v[!is.finite(v)] <- mu
+    out <- (v - mu) / sdv
+    names(out) <- nm
+    out
+  }
+
+  X <- do.call(rbind, lapply(present, function(g) get_z(mat0[g, ])))
+  rownames(X) <- present
+  colnames(X) <- colnames(mat0)
+
+  # combine COPS7A/7B
+  if (combine_7AB && all(c("COPS7A", "COPS7B") %in% rownames(X))) {
+    Z7 <- colMeans(X[c("COPS7A", "COPS7B"), , drop = FALSE], na.rm = TRUE)
+    X <- rbind(X[setdiff(rownames(X), c("COPS7A", "COPS7B")), , drop = FALSE],
+      "COPS7*" = Z7
+    )
+  }
+
+  enough <- colSums(is.finite(mat0[present, , drop = FALSE])) >= min_members
+  keep_sam <- names(s)[enough]
+
+  if (length(keep_sam) >= 10) {
+    pc <- stats::prcomp(t(X[, keep_sam, drop = FALSE]), center = TRUE, scale. = FALSE)
+    sc <- pc$x[, 1]
+    # Direction correction: Same sign as subunit average z
+    mu <- colMeans(X[, keep_sam, drop = FALSE], na.rm = TRUE)
+    if (suppressWarnings(cor(sc, mu, use = "pairwise.complete.obs")) < 0) sc <- -sc
+    s[keep_sam] <- sc
+  }
+
+  s
+}
+
+## Safe version: wraps build_csn_score with error handling and fallback
+build_csn_score_safe <- function(mat0, subunits, combine_7AB = TRUE,
+                                 min_members = 5L, pca_min_samples = 10L) {
+  sub <- intersect(subunits, rownames(mat0))
+  out_na <- setNames(rep(NA_real_, ncol(mat0)), colnames(mat0))
+  if (length(sub) < min_members) {
+    return(out_na)
+  }
+
+  cs_try <- try(
+    {
+      build_csn_score(mat0, subunits = sub, combine_7AB = combine_7AB, min_members = min_members)
+    },
+    silent = TRUE
+  )
+
+  if (!inherits(cs_try, "try-error") && sum(is.finite(cs_try)) >= pca_min_samples) {
+    return(cs_try)
+  }
+
+  X <- .clean_for_pca(mat0[sub, , drop = FALSE], min_samples = pca_min_samples, min_genes = min_members)
+  if (is.null(X)) {
+    message("[CSN_SCORE-safe] Insufficient available subunits or samples; returning all NA")
+    return(out_na)
+  }
+  pc <- try(stats::prcomp(t(X), center = TRUE, scale. = TRUE), silent = TRUE)
+  if (inherits(pc, "try-error")) {
+    message("[CSN_SCORE-safe] prcomp failed; returning all NA")
+    return(out_na)
+  }
+  sc <- pc$x[, 1]
+  names(sc) <- rownames(pc$x)
+  ref <- colMeans(X, na.rm = TRUE)
+  rr <- suppressWarnings(stats::cor(sc, ref, use = "pairwise.complete.obs"))
+  if (is.finite(rr) && rr < 0) sc <- -sc
+  out <- out_na
+  out[names(sc)] <- as.numeric(sc)
+
+  varpc1 <- if (!is.null(pc$sdev)) (pc$sdev[1]^2) / sum(pc$sdev^2) else NA_real_
+  message(sprintf("[CSN_SCORE-safe] fallback: genes=%d; PC1%%=%.1f; nonNA=%d/%d",
+                  nrow(X), 100 * varpc1, sum(is.finite(out)), length(out)))
+  out
+}
+
 # ---- 5. Main function: limma DEG for one dataset + stratum ---------------
 
 run_limma_deg_one_dataset <- function(
@@ -321,6 +448,13 @@ run_limma_deg_one_dataset <- function(
   message(sprintf("[%s|%s] Found %d / %d CSN subunits: %s",
                   ds_id, stratum, length(csn_row_map), length(subunits),
                   paste(names(csn_row_map), collapse = ", ")))
+
+  # --- 5b2. Build gene-symbol-keyed matrix for CSN_SCORE computation -------
+  # mat0_csn: rows = gene symbols of present CSN subunits, cols = samples
+  present_sub <- names(csn_row_map)
+  mat0_csn <- expr_mat[unlist(csn_row_map), , drop = FALSE]
+  rownames(mat0_csn) <- present_sub
+  storage.mode(mat0_csn) <- "double"
 
   # --- 5c. Read covariates -------------------------------------------------
 
@@ -432,41 +566,97 @@ run_limma_deg_one_dataset <- function(
                     ds_id, stratum))
   }
 
-  # --- 5e. Run limma for each CSN subunit ----------------------------------
+  # --- 5e. Build predictor list: individual CSN subunits + CSN_SCORE -------
+
+  # Compute CSN_SCORE via PCA PC1 of z-scored CSN subunit abundances
+  csn_score_vec <- build_csn_score_safe(
+    mat0         = mat0_csn,
+    subunits     = present_sub,
+    combine_7AB  = TRUE,
+    min_members  = 5L,
+    pca_min_samples = 10L
+  )
+
+  csn_score_valid <- sum(is.finite(csn_score_vec))
+  message(sprintf("[%s|%s] CSN_SCORE computed: %d / %d samples with valid score",
+                  ds_id, stratum, csn_score_valid, length(csn_score_vec)))
+
+  # Build predictor list: each individual CSN subunit + CSN_SCORE
+  predictor_list <- list()
+  for (sub in present_sub) {
+    v <- as.numeric(expr_mat[csn_row_map[[sub]], ])
+    names(v) <- all_sample_ids
+    predictor_list[[sub]] <- v
+  }
+  # Add CSN_SCORE only if it has enough valid values
+  csn_score_available <- (csn_score_valid >= 10)
+  if (csn_score_available) {
+    predictor_list[["CSN_SCORE"]] <- csn_score_vec
+  } else {
+    message(sprintf("[%s|%s] CSN_SCORE has < 10 valid samples, skipping CSN_SCORE predictor",
+                    ds_id, stratum))
+  }
+
+  # Add resid_* predictors: same subunit abundance as predictor, but with
+  # CSN_SCORE added as an additional covariate to partial out the shared
+  # CSN complex activity. Only available when CSN_SCORE is valid.
+  if (csn_score_available) {
+    for (sub in present_sub) {
+      resid_name <- paste0("resid_", sub)
+      predictor_list[[resid_name]] <- predictor_list[[sub]]
+    }
+    message(sprintf("[%s|%s] Added %d resid_* predictors (with CSN_SCORE as covariate)",
+                    ds_id, stratum, length(present_sub)))
+  } else {
+    message(sprintf("[%s|%s] Skipping resid_* predictors (CSN_SCORE not available)",
+                    ds_id, stratum))
+  }
+
+  # Collect Ensembl IDs of all CSN subunit genes for is_predictor flagging
+  all_csn_ensembl_base <- sub("\\.[0-9]+$", "",
+                              ensembl_ids_raw[unlist(csn_row_map)])
+
+  # --- 5f. Run limma for each predictor ------------------------------------
 
   all_deg_results <- list()
 
-  for (sub in names(csn_row_map)) {
+  for (pred_name in names(predictor_list)) {
 
     message(sprintf("\n  [%s|%s | %s] Running limma DEG analysis ...",
-                    ds_id, stratum, sub))
+                    ds_id, stratum, pred_name))
 
-    # Extract CSN subunit protein abundance as the continuous predictor
-    csn_abund <- as.numeric(expr_mat[csn_row_map[[sub]], ])
-    names(csn_abund) <- all_sample_ids
+    # Detect if this is a resid_* predictor (CSN_SCORE as additional covariate)
+    is_resid_predictor <- startsWith(pred_name, "resid_")
 
-    # Identify samples with non-NA CSN abundance AND complete covariates
-    ok_csn <- !is.na(csn_abund)
+    # Extract predictor vector
+    pred_vec <- predictor_list[[pred_name]]
+
+    # Identify samples with non-NA predictor AND complete covariates
+    # For resid_* predictors, also require non-NA CSN_SCORE
+    ok_pred <- !is.na(pred_vec)
+    if (is_resid_predictor) {
+      ok_pred <- ok_pred & is.finite(csn_score_vec)
+    }
     if (ncol(cov_use) > 0) {
       ok_cov <- complete.cases(cov_use)
     } else {
       ok_cov <- rep(TRUE, length(all_sample_ids))
     }
-    ok_samples <- ok_csn & ok_cov
+    ok_samples <- ok_pred & ok_cov
     sam_use <- all_sample_ids[ok_samples]
 
     if (length(sam_use) < 10) {
       message(sprintf("  [%s|%s | %s] Only %d valid samples (need >= 10), skip",
-                      ds_id, stratum, sub, length(sam_use)))
+                      ds_id, stratum, pred_name, length(sam_use)))
       next
     }
 
     message(sprintf("  [%s|%s | %s] Samples used: %d / %d (valid predictor + covariates)",
-                    ds_id, stratum, sub, length(sam_use), length(all_sample_ids)))
+                    ds_id, stratum, pred_name, length(sam_use), length(all_sample_ids)))
 
     # Subset expression matrix and predictor to valid samples
     expr_sub <- expr_mat[, sam_use, drop = FALSE]
-    csn_sub  <- csn_abund[sam_use]
+    pred_sub <- pred_vec[sam_use]
 
     # Filter genes: require sufficient non-NA values across valid samples
     n_nonmissing <- rowSums(!is.na(expr_sub))
@@ -475,21 +665,25 @@ run_limma_deg_one_dataset <- function(
     expr_sub     <- expr_sub[gene_keep, , drop = FALSE]
 
     message(sprintf("  [%s|%s | %s] Genes retained (>= %d non-NA values): %d / %d",
-                    ds_id, stratum, sub, threshold,
+                    ds_id, stratum, pred_name, threshold,
                     sum(gene_keep), length(gene_keep)))
 
     if (nrow(expr_sub) == 0) {
       message(sprintf("  [%s|%s | %s] No genes passed the filter, skip",
-                      ds_id, stratum, sub))
+                      ds_id, stratum, pred_name))
       next
     }
 
-    # Build design matrix: ~ csn_abundance + covariates
+    # Build design matrix: ~ csn_abundance + [csn_score] + covariates
     design_df <- data.frame(
-      csn_abundance = csn_sub,
+      csn_abundance = pred_sub,
       row.names     = sam_use,
       check.names   = FALSE
     )
+    # For resid_* predictors, add CSN_SCORE as an additional covariate
+    if (is_resid_predictor) {
+      design_df$csn_score_cov <- csn_score_vec[sam_use]
+    }
     if (ncol(cov_use) > 0) {
       for (cn in names(cov_use)) {
         design_df[[cn]] <- cov_use[sam_use, cn]
@@ -503,14 +697,14 @@ run_limma_deg_one_dataset <- function(
     if (qr_design$rank < ncol(design_mat)) {
       message(sprintf(
         "  [%s|%s | %s] Warning: design matrix rank-deficient (%d / %d cols). Removing dependent columns.",
-        ds_id, stratum, sub, qr_design$rank, ncol(design_mat)))
+        ds_id, stratum, pred_name, qr_design$rank, ncol(design_mat)))
       keep_cols  <- qr_design$pivot[seq_len(qr_design$rank)]
       design_mat <- design_mat[, keep_cols, drop = FALSE]
     }
 
     # Print design matrix column names for verification
     message(sprintf("  [%s|%s | %s] Design matrix columns: %s",
-                    ds_id, stratum, sub,
+                    ds_id, stratum, pred_name,
                     paste(colnames(design_mat), collapse = ", ")))
 
     # Run limma: lmFit + eBayes
@@ -521,7 +715,7 @@ run_limma_deg_one_dataset <- function(
     coef_name <- "csn_abundance"
     if (!(coef_name %in% colnames(fit$coefficients))) {
       message(sprintf("  [%s|%s | %s] Coefficient '%s' not found in fitted model, skip",
-                      ds_id, stratum, sub, coef_name))
+                      ds_id, stratum, pred_name, coef_name))
       next
     }
 
@@ -539,15 +733,27 @@ run_limma_deg_one_dataset <- function(
     matched_symbols      <- gene_symbols[matched_ensembl_raw]
     matched_ensembl_base <- sub("\\.[0-9]+$", "", matched_ensembl_raw)
 
-    # Flag if the tested gene is the predictor CSN subunit itself
-    predictor_ensembl_base <- sub("\\.[0-9]+$", "",
-                                  ensembl_ids_raw[csn_row_map[[sub]]])
-    is_self_predictor <- (matched_ensembl_base == predictor_ensembl_base)
+    # Flag is_predictor:
+    #   For individual subunits: flag only the predictor gene itself
+    #   For CSN_SCORE: flag ALL CSN subunit genes (they all contribute)
+    #   For resid_*: flag the corresponding subunit gene
+    if (pred_name == "CSN_SCORE") {
+      is_self_predictor <- (matched_ensembl_base %in% all_csn_ensembl_base)
+    } else if (is_resid_predictor) {
+      base_sub <- sub("^resid_", "", pred_name)
+      predictor_ensembl_base <- sub("\\.[0-9]+$", "",
+                                    ensembl_ids_raw[csn_row_map[[base_sub]]])
+      is_self_predictor <- (matched_ensembl_base == predictor_ensembl_base)
+    } else {
+      predictor_ensembl_base <- sub("\\.[0-9]+$", "",
+                                    ensembl_ids_raw[csn_row_map[[pred_name]]])
+      is_self_predictor <- (matched_ensembl_base == predictor_ensembl_base)
+    }
 
     result_df <- data.frame(
       dataset          = ds_id,
       stratum          = stratum,
-      csn_subunit      = sub,
+      csn_subunit      = pred_name,
       ensembl_id       = matched_ensembl_raw,
       ensembl_id_base  = matched_ensembl_base,
       gene_symbol      = matched_symbols,
@@ -574,34 +780,34 @@ run_limma_deg_one_dataset <- function(
     n_sig_025  <- sum(result_df$BH_FDR < 0.25, na.rm = TRUE)
     message(sprintf(
       "  [%s|%s | %s] Results: %d genes tested | BH FDR < 0.05: %d | < 0.1: %d | < 0.25: %d",
-      ds_id, stratum, sub, n_tested, n_sig_005, n_sig_01, n_sig_025
+      ds_id, stratum, pred_name, n_tested, n_sig_005, n_sig_01, n_sig_025
     ))
 
-    all_deg_results[[sub]] <- result_df
+    all_deg_results[[pred_name]] <- result_df
 
-    # Save per-subunit CSV
+    # Save per-predictor CSV
     per_sub_file <- file.path(ds_out,
-      paste0(ds_id, "_", stratum, "_limma_DEG_predictor_", sub, ".csv"))
+      paste0(ds_id, "_", stratum, "_limma_DEG_predictor_", pred_name, ".csv"))
     data.table::fwrite(result_df, per_sub_file)
     message(sprintf("  [%s|%s | %s] Saved: %s",
-                    ds_id, stratum, sub, basename(per_sub_file)))
+                    ds_id, stratum, pred_name, basename(per_sub_file)))
   }
 
-  # --- 5f. Save combined results for this dataset + stratum ----------------
+  # --- 5g. Save combined results for this dataset + stratum ----------------
 
   if (length(all_deg_results) > 0) {
     combined <- do.call(rbind, all_deg_results)
     rownames(combined) <- NULL
 
     combined_file <- file.path(ds_out,
-      paste0(ds_id, "_", stratum, "_limma_DEG_all_CSN_subunits.csv"))
+      paste0(ds_id, "_", stratum, "_limma_DEG_all_predictors.csv"))
     data.table::fwrite(combined, combined_file)
     message(sprintf("\n[%s|%s] Combined CSV saved: %s",
                     ds_id, stratum, basename(combined_file)))
 
     return(invisible(combined))
   } else {
-    message(sprintf("\n[%s|%s] No DEG results generated for any CSN subunit",
+    message(sprintf("\n[%s|%s] No DEG results generated for any predictor",
                     ds_id, stratum))
     return(invisible(NULL))
   }
@@ -612,7 +818,7 @@ run_limma_deg_one_dataset <- function(
 
 message("\n============================================================")
 message("  CSN Subunits Protein Abundance Limma DEG Analysis")
-message("  Predictor: each CSN subunit's protein abundance (continuous)")
+message("  Predictors: each CSN subunit's protein abundance + CSN_SCORE (continuous)")
 message("  Covariates: Sex, Age, Tumor Purity (WES_purity)")
 message("  Stratification: TP53 mutation status")
 message("  FDR method: Benjamini-Hochberg")
@@ -684,14 +890,14 @@ if (length(all_results) > 0) {
     dir.create(st_dir, showWarnings = FALSE, recursive = TRUE)
 
     combined_csv <- file.path(st_dir,
-      paste0("ALL_datasets_", st, "_limma_DEG_all_CSN_subunits.csv"))
+      paste0("ALL_datasets_", st, "_limma_DEG_all_predictors.csv"))
     data.table::fwrite(st_data, combined_csv)
     message(sprintf("\n[%s] Combined CSV saved: %s", st, combined_csv))
   }
 
   # --- Grand combined file (all strata together) ---
   grand_file <- file.path(OUT_ROOT,
-    "ALL_datasets_ALL_strata_limma_DEG_all_CSN_subunits.csv")
+    "ALL_datasets_ALL_strata_limma_DEG_all_predictors.csv")
   data.table::fwrite(grand_combined, grand_file)
   message(sprintf("\nGrand combined CSV saved: %s", grand_file))
 
