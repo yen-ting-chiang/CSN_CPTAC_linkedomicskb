@@ -164,9 +164,9 @@ message(sprintf("[Discovery] Found %d per-subunit DEG result files", length(deg_
 parse_deg_path <- function(filepath) {
   fname <- tools::file_path_sans_ext(basename(filepath))
   # Pattern: {DS}_{STRATUM}_limma_DEG_predictor_{SUBUNIT}
-  # STRATUM can be TP53_all, TP53_MUT, or TP53_WT
+  # STRATUM can be TP53_all, TP53_interaction, TP53_MUT, or TP53_WT
   m <- regmatches(fname, regexec(
-    "^(.+?)_(TP53_(?:all|MUT|WT))_limma_DEG_predictor_(.+)$", fname
+    "^(.+?)_(TP53_(?:all|interaction|MUT|WT))_limma_DEG_predictor_(.+)$", fname
   ))[[1]]
   if (length(m) == 4) {
     return(data.frame(
