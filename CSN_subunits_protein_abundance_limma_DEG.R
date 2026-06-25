@@ -28,7 +28,10 @@
 ##                  - Sex (categorical): mode imputation
 ##                  - Age (continuous):  median imputation
 ##                  - Tumor purity (continuous): median imputation
-##  Stratification: TP53 mutation status (TP53_all, TP53_MUT, TP53_WT)
+##  Stratification: TP53 mutation status (TP53_all, TP53_MUT, TP53_WT,
+##                  and TP53_interaction).
+##                  TP53_interaction tests the predictor * TP53_status
+##                  interaction term in the union of MUT and WT samples.
 ## =========================================================================
 
 # ---- 0. Load / install required packages ---------------------------------
@@ -75,7 +78,7 @@ CSN_SUBUNITS <- c("GPS1", "COPS2", "COPS3", "COPS4", "COPS5",
                    "COPS6", "COPS7A", "COPS7B", "COPS8", "COPS9")
 
 # TP53 stratification strata
-TP53_STRATA <- c("TP53_all", "TP53_MUT", "TP53_WT")
+TP53_STRATA <- c("TP53_all", "TP53_MUT", "TP53_WT", "TP53_interaction")
 
 # Datasets excluded from TP53 stratification:
 #   CCRCC: too few TP53 mutant samples (5/103)
@@ -354,6 +357,7 @@ run_limma_deg_one_dataset <- function(
     ds_id,
     stratum       = "TP53_all",
     sample_subset = NULL,
+    tp53_lists    = NULL,
     base_dir      = BASE_DIR,
     out_root      = OUT_ROOT,
     subunits      = CSN_SUBUNITS,
@@ -674,7 +678,7 @@ run_limma_deg_one_dataset <- function(
       next
     }
 
-    # Build design matrix: ~ csn_abundance + [csn_score] + covariates
+    # Build design matrix base
     design_df <- data.frame(
       csn_abundance = pred_sub,
       row.names     = sam_use,
@@ -684,13 +688,32 @@ run_limma_deg_one_dataset <- function(
     if (is_resid_predictor) {
       design_df$csn_score_cov <- csn_score_vec[sam_use]
     }
+    # For TP53_interaction, add TP53_status
+    if (stratum == "TP53_interaction") {
+      tp53_stat <- rep(NA_character_, length(sam_use))
+      tp53_stat[sam_use %in% tp53_lists$TP53_MUT] <- "MUT"
+      tp53_stat[sam_use %in% tp53_lists$TP53_WT]  <- "WT"
+      design_df$TP53_status <- factor(tp53_stat, levels = c("WT", "MUT")) # WT is reference
+    }
     if (ncol(cov_use) > 0) {
       for (cn in names(cov_use)) {
         design_df[[cn]] <- cov_use[sam_use, cn]
       }
     }
 
-    design_mat <- model.matrix(~ ., data = design_df)
+    # Construct formula dynamically
+    form_str <- "~ csn_abundance"
+    if (stratum == "TP53_interaction") {
+      form_str <- "~ csn_abundance * TP53_status"
+    }
+    if (is_resid_predictor) {
+      form_str <- paste(form_str, "+ csn_score_cov")
+    }
+    if (ncol(cov_use) > 0) {
+      form_str <- paste(form_str, "+", paste(names(cov_use), collapse = " + "))
+    }
+
+    design_mat <- model.matrix(as.formula(form_str), data = design_df)
 
     # Safety check: rank deficiency
     qr_design <- qr(design_mat)
@@ -711,8 +734,19 @@ run_limma_deg_one_dataset <- function(
     fit <- limma::lmFit(expr_sub, design_mat)
     fit <- limma::eBayes(fit)
 
-    # The coefficient of interest is "csn_abundance"
-    coef_name <- "csn_abundance"
+    # Determine coefficient of interest
+    if (stratum == "TP53_interaction") {
+      # We want the interaction term (csn_abundance:TP53_statusMUT)
+      coef_match <- grep("csn_abundance:TP53_status|TP53_status.*:csn_abundance", colnames(fit$coefficients), value = TRUE)
+      if (length(coef_match) > 0) {
+        coef_name <- coef_match[1]
+      } else {
+        coef_name <- "MISSING_INTERACTION"
+      }
+    } else {
+      coef_name <- "csn_abundance"
+    }
+
     if (!(coef_name %in% colnames(fit$coefficients))) {
       message(sprintf("  [%s|%s | %s] Coefficient '%s' not found in fitted model, skip",
                       ds_id, stratum, pred_name, coef_name))
@@ -844,6 +878,13 @@ for (ds in DATASETS) {
     # Determine sample subset for each stratum
     if (st == "TP53_all") {
       sample_sub <- NULL  # use all samples in proteomics data
+    } else if (st == "TP53_interaction") {
+      if (!is.null(tp53_lists) && length(tp53_lists$TP53_MUT) > 0 && length(tp53_lists$TP53_WT) > 0) {
+        sample_sub <- union(tp53_lists$TP53_MUT, tp53_lists$TP53_WT)
+      } else {
+        message(sprintf("[%s|%s] Missing MUT or WT samples, skip", ds, st))
+        next
+      }
     } else if (!is.null(tp53_lists)) {
       sample_sub <- tp53_lists[[st]]
       if (is.null(sample_sub) || length(sample_sub) == 0) {
@@ -859,7 +900,8 @@ for (ds in DATASETS) {
       run_limma_deg_one_dataset(
         ds_id         = ds,
         stratum       = st,
-        sample_subset = sample_sub
+        sample_subset = sample_sub,
+        tp53_lists    = tp53_lists
       ),
       error = function(e) {
         message(sprintf("[%s|%s] ERROR: %s", ds, st, conditionMessage(e)))
