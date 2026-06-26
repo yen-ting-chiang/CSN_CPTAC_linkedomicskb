@@ -37,9 +37,15 @@ PATHWAY_COMBOS <- list(
 ## You can specify which combination to run by modifying this vector.
 COMBOS_TO_RUN <- c("combo1", "combo2")
 
-## Define parameters
-DEFAULT_STRATUM <- "TP53_all"
-DEFAULT_PREDICTOR <- "CSN_SCORE"
+## Select which stratums to draw
+## You can specify which stratums to run by modifying this vector.
+STRATA_TO_RUN <- c("TP53_all", "TP53_WT", "TP53_MUT", "TP53_interaction")
+
+## Select which predictors to draw
+## You can specify which predictors to run by modifying this vector.
+PREDICTORS_TO_RUN <- c("CSN_SCORE", "COPS7A", "COPS7B")
+
+## Define collection parameter
 DEFAULT_COLLECTION <- "Hallmark"
 
 ## -------------------------------------------------------------------------
@@ -48,8 +54,8 @@ DEFAULT_COLLECTION <- "Hallmark"
 generate_gsea_bubble_plot <- function(
   gsea_prefix = GSEA_PREFIX,
   output_dir = OUTPUT_DIR,
-  stratum = DEFAULT_STRATUM,
-  predictor = DEFAULT_PREDICTOR,
+  stratum,
+  predictor,
   collection = DEFAULT_COLLECTION,
   genesets,
   datasets = DEFAULT_DATASETS,
@@ -108,6 +114,9 @@ generate_gsea_bubble_plot <- function(
   ## Calculate -log10(padj) for bubble size
   plot_data$neg_log10_padj <- -log10(plot_data$padj + 1e-300) # Add small value to avoid Inf
   
+  ## Determine border thickness based on padj
+  plot_data$border_thickness <- ifelse(plot_data$padj < 0.05, 1.5, 0.5)
+  
   ## Create factor levels for proper ordering
   plot_data$dataset <- factor(plot_data$dataset, levels = rev(datasets)) # Reverse for y-axis
   plot_data$pathway <- factor(plot_data$pathway, levels = genesets)
@@ -124,8 +133,8 @@ generate_gsea_bubble_plot <- function(
   
   ## Create bubble plot using ggplot2
   p <- ggplot2::ggplot(plot_data, ggplot2::aes(x = pathway, y = dataset)) +
-    ggplot2::geom_point(ggplot2::aes(size = neg_log10_padj, fill = NES),
-      shape = 21, color = "black", stroke = 0.5
+    ggplot2::geom_point(ggplot2::aes(size = neg_log10_padj, fill = NES, stroke = border_thickness),
+      shape = 21, color = "black"
     ) +
     ggplot2::scale_fill_gradient2(
       low = color_low,
@@ -139,6 +148,8 @@ generate_gsea_bubble_plot <- function(
       range = c(3, 12),
       name = expression(-log[10](padj))
     ) +
+    ggplot2::scale_discrete_identity(aesthetics = "stroke") +
+    ggplot2::guides(stroke = "none") +
     ggplot2::scale_x_discrete(labels = short_labels) +
     ggplot2::labs(
       x = "Hallmark Gene Sets",
@@ -199,22 +210,28 @@ generate_gsea_bubble_plot <- function(
 ## Execution
 ## -------------------------------------------------------------------------
 
-## Loop through selected combinations to plot
-for (combo_name in COMBOS_TO_RUN) {
-  if (combo_name %in% names(PATHWAY_COMBOS)) {
-    genesets <- PATHWAY_COMBOS[[combo_name]]
-    
-    ## Adjust width based on the number of genesets (optional tuning)
-    plot_width <- max(6, length(genesets) * 0.8 + 3)
-    
-    generate_gsea_bubble_plot(
-      genesets = genesets,
-      output_prefix = paste0("GSEA_bubble_plot_", combo_name),
-      width = plot_width,
-      height = 6
-    )
-  } else {
-    cat(sprintf("[Warning] Combination '%s' not found in PATHWAY_COMBOS.\n", combo_name))
+## Loop through selected combinations, stratums, and predictors to plot
+for (stratum_name in STRATA_TO_RUN) {
+  for (predictor_name in PREDICTORS_TO_RUN) {
+    for (combo_name in COMBOS_TO_RUN) {
+      if (combo_name %in% names(PATHWAY_COMBOS)) {
+        genesets <- PATHWAY_COMBOS[[combo_name]]
+        
+        ## Adjust width based on the number of genesets (optional tuning)
+        plot_width <- max(6, length(genesets) * 0.8 + 3)
+        
+        generate_gsea_bubble_plot(
+          stratum = stratum_name,
+          predictor = predictor_name,
+          genesets = genesets,
+          output_prefix = paste0("GSEA_bubble_plot_", combo_name),
+          width = plot_width,
+          height = 6
+        )
+      } else {
+        cat(sprintf("[Warning] Combination '%s' not found in PATHWAY_COMBOS.\n", combo_name))
+      }
+    }
   }
 }
 
