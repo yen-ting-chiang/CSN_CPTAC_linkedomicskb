@@ -27,7 +27,7 @@ suppressPackageStartupMessages({
 
 BASE_DIR <- "C:/Users/danny/Documents/R_project/CSN_CPTAC_linkedomicskb"
 INPUT_DIR <- file.path(BASE_DIR, "CSN_subunits_phosphoprotein_abundance_limma_DPS")
-OUT_ROOT <- file.path(BASE_DIR, "CSN_subunits_protein_abundance_limma_DPS_meta")
+OUT_ROOT <- file.path(BASE_DIR, "CSN_subunits_phosphoprotein_abundance_limma_DPS_meta")
 
 # Minimum number of datasets a phosphosite must be present in to be included in meta-analysis
 MIN_DATASETS <- 3
