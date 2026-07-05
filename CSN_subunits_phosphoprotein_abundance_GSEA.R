@@ -558,101 +558,145 @@ for (i in seq_len(nrow(file_info))) {
 
 
 # ---- 7. Combined and summary outputs ------------------------------------
+#
+# This section reads per-subunit GSEA CSV files directly from the output
+# directory on disk, so it can run independently without re-executing
+# the main loop in section 6 (which may be time-consuming).
 
-if (length(all_gsea_results) > 0) {
+message("\n============================================================")
+message("  Generating combined and summary outputs")
+message(sprintf("  Reading per-subunit results from: %s", OUT_ROOT))
+message("============================================================\n")
 
-  grand_combined <- do.call(rbind, all_gsea_results)
-  rownames(grand_combined) <- NULL
+## Discover all per-subunit GSEA result files from the output directory
+## Expected file pattern: {DS}_{STRATUM}_GSEA_{COLLECTION}_predictor_{SUBUNIT}.csv
+## Located in: OUT_ROOT / {STRATUM} / {DS} /
+per_subunit_files <- list.files(
+  OUT_ROOT,
+  pattern    = "_GSEA_.*_predictor_.*\\.csv$",
+  recursive  = TRUE,
+  full.names = TRUE
+)
 
-  ## --- Per-collection combined files within each stratum ---
-  strata_present <- unique(grand_combined$stratum)
-  colls_present  <- unique(grand_combined$collection)
+if (length(per_subunit_files) == 0) {
+  stop("No per-subunit GSEA result files found in: ", OUT_ROOT,
+       "\nPlease run section 6 (main loop) first.")
+}
 
-  for (st in strata_present) {
-    st_data <- grand_combined[grand_combined$stratum == st, ]
-    if (nrow(st_data) == 0) next
+message(sprintf("[Discovery] Found %d per-subunit GSEA result files", length(per_subunit_files)))
 
-    st_dir <- file.path(OUT_ROOT, st)
-    dir.create(st_dir, showWarnings = FALSE, recursive = TRUE)
+## Read and combine all per-subunit files
+all_results_list <- lapply(per_subunit_files, function(fp) {
+  tryCatch({
+    df <- data.table::fread(fp, header = TRUE)
+    if (nrow(df) > 0) df else NULL
+  }, error = function(e) {
+    warning(sprintf("Failed to read: %s (%s)", basename(fp), conditionMessage(e)))
+    NULL
+  })
+})
+all_results_list <- all_results_list[!sapply(all_results_list, is.null)]
 
-    for (cl in colls_present) {
-      cl_data <- st_data[st_data$collection == cl, ]
-      if (nrow(cl_data) == 0) next
+if (length(all_results_list) == 0) {
+  stop("No valid per-subunit GSEA result files could be read.")
+}
 
-      ## Sort by NES descending
-      cl_data <- cl_data[order(-cl_data$NES), ]
+grand_combined <- data.table::rbindlist(all_results_list, use.names = TRUE, fill = TRUE)
+grand_combined <- as.data.frame(grand_combined)
 
-      ## Per-stratum per-collection combined file
-      combined_file <- file.path(st_dir,
-        paste0("ALL_datasets_", st, "_GSEA_", cl,
-               "_all_CSN_subunits.csv"))
-      data.table::fwrite(cl_data, combined_file)
-      message(sprintf("[%s|%s] Combined CSV: %s", st, cl, basename(combined_file)))
-    }
+message(sprintf("[Combined] Read %d files, %d total rows",
+                length(all_results_list), nrow(grand_combined)))
+
+## --- Per-collection combined files within each stratum ---
+strata_present <- unique(grand_combined$stratum)
+colls_present  <- unique(grand_combined$collection)
+
+message(sprintf("  Datasets: %s", paste(sort(unique(grand_combined$dataset)), collapse = ", ")))
+message(sprintf("  Strata  : %s", paste(sort(strata_present), collapse = ", ")))
+message(sprintf("  Subunits: %s", paste(sort(unique(grand_combined$csn_subunit)), collapse = ", ")))
+message(sprintf("  Collections: %s\n", paste(sort(colls_present), collapse = ", ")))
+
+for (st in strata_present) {
+  st_data <- grand_combined[grand_combined$stratum == st, ]
+  if (nrow(st_data) == 0) next
+
+  st_dir <- file.path(OUT_ROOT, st)
+  dir.create(st_dir, showWarnings = FALSE, recursive = TRUE)
+
+  for (cl in colls_present) {
+    cl_data <- st_data[st_data$collection == cl, ]
+    if (nrow(cl_data) == 0) next
 
     ## Sort by NES descending
-    st_data <- st_data[order(-st_data$NES), ]
+    cl_data <- cl_data[order(-cl_data$NES), ]
 
-    ## Per-stratum all-collections combined file
-    st_all_file <- file.path(st_dir,
-      paste0("ALL_datasets_", st, "_GSEA_all_collections_all_CSN_subunits.csv"))
-    data.table::fwrite(st_data, st_all_file)
-    message(sprintf("[%s] All-collections combined CSV: %s", st, basename(st_all_file)))
+    ## Per-stratum per-collection combined file
+    combined_file <- file.path(st_dir,
+      paste0("ALL_datasets_", st, "_GSEA_", cl,
+             "_all_CSN_subunits.csv"))
+    data.table::fwrite(cl_data, combined_file)
+    message(sprintf("[%s|%s] Combined CSV: %s", st, cl, basename(combined_file)))
   }
 
-  ## --- Grand combined file (all strata, all collections) ---
   ## Sort by NES descending
-  grand_combined <- grand_combined[order(-grand_combined$NES), ]
+  st_data <- st_data[order(-st_data$NES), ]
 
-  grand_file <- file.path(OUT_ROOT,
-    "ALL_datasets_ALL_strata_GSEA_all_collections_all_CSN_subunits.csv")
-  data.table::fwrite(grand_combined, grand_file)
-  message(sprintf("\nGrand combined CSV: %s", grand_file))
-
-  ## --- Summary table ---
-  summary_df <- grand_combined %>%
-    dplyr::group_by(dataset, stratum, csn_subunit, collection) %>%
-    dplyr::summarise(
-      n_ranked_sites        = dplyr::first(n_ranked_sites),
-      n_augmented_entries   = dplyr::first(n_augmented),
-      n_signatures_tested   = dplyr::n(),
-      n_sig_FDR_0.05        = sum(padj < 0.05, na.rm = TRUE),
-      n_sig_FDR_0.10        = sum(padj < 0.10, na.rm = TRUE),
-      n_sig_FDR_0.25        = sum(padj < 0.25, na.rm = TRUE),
-      n_concordant_FDR_0.25 = sum(padj < 0.25 & NES > 0, na.rm = TRUE),
-      n_discordant_FDR_0.25 = sum(padj < 0.25 & NES < 0, na.rm = TRUE),
-      top_signature         = pathway[which.min(pval)],
-      top_signature_NES     = NES[which.min(pval)],
-      top_signature_padj    = padj[which.min(pval)],
-      .groups = "drop"
-    )
-
-  summary_file <- file.path(OUT_ROOT,
-    "ALL_datasets_ALL_strata_GSEA_summary.csv")
-  data.table::fwrite(summary_df, summary_file)
-  message(sprintf("Summary CSV: %s", summary_file))
-
-  ## Per-stratum summary files
-  for (st in strata_present) {
-    st_summary <- summary_df[summary_df$stratum == st, ]
-    if (nrow(st_summary) == 0) next
-    st_dir <- file.path(OUT_ROOT, st)
-    st_summary_file <- file.path(st_dir,
-      paste0("ALL_datasets_", st, "_GSEA_summary.csv"))
-    data.table::fwrite(st_summary, st_summary_file)
-    message(sprintf("[%s] Summary CSV: %s", st, basename(st_summary_file)))
-  }
-
-  ## Print summary table to console
-  message("\n========== PTM-SEA Summary ==========")
-  print(as.data.frame(summary_df), row.names = FALSE)
-
-} else {
-  message("\nNo PTM-SEA results were generated.")
+  ## Per-stratum all-collections combined file
+  st_all_file <- file.path(st_dir,
+    paste0("ALL_datasets_", st, "_GSEA_all_collections_all_CSN_subunits.csv"))
+  data.table::fwrite(st_data, st_all_file)
+  message(sprintf("[%s] All-collections combined CSV: %s", st, basename(st_all_file)))
 }
+
+## --- Grand combined file (all strata, all collections) ---
+## Sort by NES descending
+grand_combined <- grand_combined[order(-grand_combined$NES), ]
+
+grand_file <- file.path(OUT_ROOT,
+  "ALL_datasets_ALL_strata_GSEA_all_collections_all_CSN_subunits.csv")
+data.table::fwrite(grand_combined, grand_file)
+message(sprintf("\nGrand combined CSV: %s", grand_file))
+
+## --- Summary table ---
+summary_df <- grand_combined %>%
+  dplyr::group_by(dataset, stratum, csn_subunit, collection) %>%
+  dplyr::summarise(
+    n_ranked_sites        = dplyr::first(n_ranked_sites),
+    n_augmented_entries   = dplyr::first(n_augmented),
+    n_signatures_tested   = dplyr::n(),
+    n_sig_FDR_0.05        = sum(padj < 0.05, na.rm = TRUE),
+    n_sig_FDR_0.10        = sum(padj < 0.10, na.rm = TRUE),
+    n_sig_FDR_0.25        = sum(padj < 0.25, na.rm = TRUE),
+    n_concordant_FDR_0.25 = sum(padj < 0.25 & NES > 0, na.rm = TRUE),
+    n_discordant_FDR_0.25 = sum(padj < 0.25 & NES < 0, na.rm = TRUE),
+    top_signature         = pathway[which.min(pval)],
+    top_signature_NES     = NES[which.min(pval)],
+    top_signature_padj    = padj[which.min(pval)],
+    .groups = "drop"
+  )
+
+summary_file <- file.path(OUT_ROOT,
+  "ALL_datasets_ALL_strata_GSEA_summary.csv")
+data.table::fwrite(summary_df, summary_file)
+message(sprintf("Summary CSV: %s", summary_file))
+
+## Per-stratum summary files
+for (st in strata_present) {
+  st_summary <- summary_df[summary_df$stratum == st, ]
+  if (nrow(st_summary) == 0) next
+  st_dir <- file.path(OUT_ROOT, st)
+  st_summary_file <- file.path(st_dir,
+    paste0("ALL_datasets_", st, "_GSEA_summary.csv"))
+  data.table::fwrite(st_summary, st_summary_file)
+  message(sprintf("[%s] Summary CSV: %s", st, basename(st_summary_file)))
+}
+
+## Print summary table to console
+message("\n========== PTM-SEA Summary ==========")
+print(as.data.frame(summary_df), row.names = FALSE)
 
 
 message("\n============================================================")
-message("  All PTM-SEA analyses completed!")
+message("  All combined/summary outputs completed!")
 message(sprintf("  Output directory: %s", OUT_ROOT))
 message("============================================================\n")
