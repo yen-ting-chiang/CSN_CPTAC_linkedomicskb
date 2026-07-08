@@ -6,20 +6,27 @@
 ##  Purpose:
 ##    Perform cross-dataset meta-analysis of Pearson partial correlation
 ##    results (CSN subunit protein abundance vs cell type deconvolution
-##    scores) using Stouffer's z-score method with sample-size weighting,
-##    followed by Benjamini-Hochberg FDR correction.
+##    scores) using two complementary methods, each followed by
+##    Benjamini-Hochberg FDR correction:
 ##
-##  Methodology:
-##    Stouffer's z-score method (Liptak-Stouffer):
+##  Method 1: Stouffer's z-score method (Liptak-Stouffer)
+##    A p-value combination approach:
 ##      1. Convert each per-dataset two-sided p-value to a one-sided
 ##         z-score, preserving the sign of the Pearson r.
 ##      2. Weight z-scores by sqrt(n_samples) per dataset.
 ##      3. Combine: Z_meta = sum(w_i * z_i) / sqrt(sum(w_i^2))
 ##      4. Convert Z_meta back to a two-sided p-value.
-##      5. Apply Benjamini-Hochberg FDR correction.
 ##
-##    Additionally, the script reports the sample-size-weighted mean
-##    Pearson r across datasets as an effect-size summary.
+##  Method 2: Fisher's z-transformation meta-analysis
+##    An effect-size combination approach designed for correlations:
+##      1. Transform each Pearson r to Fisher's z: z_i = atanh(r_i)
+##      2. Each z_i has variance: var_i = 1 / (n_i - 3)
+##      3. Inverse-variance weighted mean:
+##         z_meta = sum(w_i * z_i) / sum(w_i),  w_i = (n_i - 3)
+##      4. Variance of z_meta: var_meta = 1 / sum(w_i)
+##      5. Test: Z = z_meta / sqrt(var_meta), two-sided p-value
+##      6. Back-transform: r_meta = tanh(z_meta)
+##      7. 95% CI: tanh(z_meta +/- 1.96 * sqrt(var_meta))
 ##
 ##  Methodology Reference:
 ##    - Stouffer, S. A. et al. (1949). The American Soldier: Adjustment
@@ -28,6 +35,11 @@
 ##      and efficient meta-analysis of genomewide association scans.
 ##      Bioinformatics, 26(17), 2190-2191.
 ##      https://doi.org/10.1093/bioinformatics/btq340
+##    - Fisher, R. A. (1921). On the "probable error" of a coefficient
+##      of correlation deduced from a small sample. Metron, 1, 3-32.
+##    - Hedges, L. V. & Olkin, I. (1985). Statistical Methods for
+##      Meta-Analysis. Academic Press.
+##      https://doi.org/10.1016/C2009-0-03396-0
 ##    - Benjamini, Y., & Hochberg, Y. (1995). Controlling the false
 ##      discovery rate: a practical and powerful approach to multiple
 ##      testing. J. R. Stat. Soc. Ser. B, 57(1), 289-300.
@@ -102,7 +114,9 @@ message(sprintf("Strata found: %s", paste(unique(full_dt$stratum), collapse = ",
 message(sprintf("Prefixes found: %s", paste(unique(full_dt$prefix), collapse = ", ")))
 message(sprintf("Predictors found: %s", paste(unique(full_dt$predictor), collapse = ", ")))
 
-# ---- 3. Meta-analysis function: Stouffer's z-score method ----------------
+# ---- 3. Meta-analysis functions ------------------------------------------
+
+# --- 3a. Stouffer's z-score method (p-value combination) ------------------
 
 run_stouffer_meta_corr <- function(df) {
   # Stouffer's z-score method (sample-size weighted)
@@ -124,30 +138,96 @@ run_stouffer_meta_corr <- function(df) {
   # 4. Convert meta Z-score back to two-sided p-value
   p_meta <- 2 * pnorm(abs(z_meta), lower.tail = FALSE)
 
-  # 5. Sample-size-weighted mean Pearson r as effect-size summary
-  w_n <- df$n_samples
-  w_n[is.na(w_n)] <- 1
-  weighted_mean_r <- sum(w_n * df$pearson_r) / sum(w_n)
+  list(
+    stouffer_Z_score  = z_meta,
+    stouffer_p_value  = p_meta
+  )
+}
 
-  # 6. Summary metrics
+# --- 3b. Fisher's z-transformation meta-analysis (effect-size combination) -
+
+run_fisher_z_meta_corr <- function(df) {
+  # Fisher's z-transformation for combining correlation coefficients
+  # Reference: Hedges & Olkin (1985), Chapter 11
+
+  r_vals <- df$pearson_r
+  n_vals <- df$n_samples
+
+  # Clamp |r| to avoid atanh(+/-1) = +/-Inf
+  r_vals <- pmin(pmax(r_vals, -0.9999999), 0.9999999)
+
+  # 1. Fisher's z-transformation: z_i = atanh(r_i)
+  fisher_z <- atanh(r_vals)
+
+  # 2. Inverse-variance weights: w_i = n_i - 3
+  #    (variance of Fisher's z is approximately 1/(n-3))
+  w <- n_vals - 3
+  w[w < 1] <- 1  # safeguard for very small samples
+
+  # 3. Weighted mean of Fisher's z
+  z_meta <- sum(w * fisher_z) / sum(w)
+
+  # 4. Variance of the weighted mean
+  var_meta <- 1 / sum(w)
+  se_meta  <- sqrt(var_meta)
+
+  # 5. Test statistic and two-sided p-value
+  Z_test <- z_meta / se_meta
+  p_meta <- 2 * pnorm(abs(Z_test), lower.tail = FALSE)
+
+  # 6. Back-transform to correlation scale: r_meta = tanh(z_meta)
+  r_meta <- tanh(z_meta)
+
+  # 7. 95% confidence interval on the r scale
+  ci_lo <- tanh(z_meta - 1.96 * se_meta)
+  ci_hi <- tanh(z_meta + 1.96 * se_meta)
+
+  list(
+    fisher_Z_score    = Z_test,
+    fisher_p_value    = p_meta,
+    fisher_meta_r     = r_meta,
+    fisher_r_CI_lower = ci_lo,
+    fisher_r_CI_upper = ci_hi,
+    fisher_z_mean     = z_meta,
+    fisher_z_se       = se_meta
+  )
+}
+
+# --- 3c. Combined meta-analysis: run both methods ------------------------
+
+run_combined_meta_corr <- function(df) {
+  # Run both Stouffer's and Fisher's methods, plus shared summary metrics
+
+  stouffer_res <- run_stouffer_meta_corr(df)
+  fisher_res   <- run_fisher_z_meta_corr(df)
+
+  # Shared summary metrics
   n_datasets     <- nrow(df)
   total_samples  <- sum(df$n_samples, na.rm = TRUE)
   datasets_incl  <- paste(df$dataset, collapse = "|")
   n_positive     <- sum(df$pearson_r > 0, na.rm = TRUE)
   n_negative     <- sum(df$pearson_r < 0, na.rm = TRUE)
   direction_consistency <- max(n_positive, n_negative) / n_datasets
+  mean_r         <- mean(df$pearson_r)
 
-  list(
-    meta_Z_score             = z_meta,
-    meta_p_value             = p_meta,
-    weighted_mean_pearson_r  = weighted_mean_r,
-    mean_pearson_r           = mean(df$pearson_r),
-    n_datasets               = n_datasets,
-    total_samples            = total_samples,
-    n_positive               = n_positive,
-    n_negative               = n_negative,
-    direction_consistency    = direction_consistency,
-    datasets                 = datasets_incl
+  # Sample-size-weighted mean Pearson r
+  w_n <- df$n_samples
+  w_n[is.na(w_n)] <- 1
+  weighted_mean_r <- sum(w_n * df$pearson_r) / sum(w_n)
+
+  c(
+    stouffer_res,
+    fisher_res,
+    list(
+      weighted_mean_pearson_r  = weighted_mean_r,
+      mean_pearson_r           = mean_r,
+      n_datasets               = n_datasets,
+      total_samples            = total_samples,
+      n_positive               = n_positive,
+      n_negative               = n_negative,
+      direction_consistency    = direction_consistency,
+      datasets                 = datasets_incl
+    )
   )
 }
 
@@ -176,9 +256,9 @@ for (strat in strata) {
       pred_dt <- sub_dt[predictor == pred]
 
       # Group by cell_type_col (the full column name, which is unique per
-      # cell type even across prefixes) and apply meta-analysis
+      # cell type even across prefixes) and apply both meta-analysis methods
       meta_res <- pred_dt[,
-        run_stouffer_meta_corr(.SD),
+        run_combined_meta_corr(.SD),
         by = .(cell_type, cell_type_col)
       ]
 
@@ -191,35 +271,44 @@ for (strat in strata) {
         next
       }
 
-      # Apply Benjamini-Hochberg FDR correction
-      meta_res[, meta_BH_FDR := p.adjust(meta_p_value, method = "BH")]
+      # Apply Benjamini-Hochberg FDR correction for both methods
+      meta_res[, stouffer_BH_FDR := p.adjust(stouffer_p_value, method = "BH")]
+      meta_res[, fisher_BH_FDR   := p.adjust(fisher_p_value,   method = "BH")]
 
       # Add metadata columns
       meta_res[, `:=`(stratum = strat, prefix = pfx, predictor = pred)]
 
-      # Reorder columns for readability
+      # Reorder columns for readability:
+      #   identifiers -> Stouffer results -> Fisher results -> shared summaries
       setcolorder(meta_res, c(
         "stratum", "prefix", "predictor",
         "cell_type", "cell_type_col",
-        "meta_p_value", "meta_BH_FDR", "meta_Z_score",
+        # Stouffer's method
+        "stouffer_p_value", "stouffer_BH_FDR", "stouffer_Z_score",
+        # Fisher's z-transformation method
+        "fisher_p_value", "fisher_BH_FDR", "fisher_Z_score",
+        "fisher_meta_r", "fisher_r_CI_lower", "fisher_r_CI_upper",
+        "fisher_z_mean", "fisher_z_se",
+        # Shared summary
         "weighted_mean_pearson_r", "mean_pearson_r",
         "n_datasets", "total_samples",
         "n_positive", "n_negative", "direction_consistency",
         "datasets"
       ))
 
-      # Sort by meta p-value
-      meta_res <- meta_res[order(meta_p_value)]
+      # Sort by Fisher p-value (effect-size based method as primary)
+      meta_res <- meta_res[order(fisher_p_value)]
 
       # Save per-predictor CSV
       out_file <- file.path(pfx_out_dir,
         paste0(strat, "_meta_", pfx, "_correlation_predictor_", pred, ".csv"))
       data.table::fwrite(meta_res, out_file)
 
-      n_sig_005 <- sum(meta_res$meta_BH_FDR < 0.05, na.rm = TRUE)
-      n_sig_010 <- sum(meta_res$meta_BH_FDR < 0.10, na.rm = TRUE)
-      message(sprintf("  Saved %s (Cell types: %d | FDR < 0.05: %d | FDR < 0.10: %d)",
-                      basename(out_file), nrow(meta_res), n_sig_005, n_sig_010))
+      n_sig_stouffer <- sum(meta_res$stouffer_BH_FDR < 0.05, na.rm = TRUE)
+      n_sig_fisher   <- sum(meta_res$fisher_BH_FDR < 0.05, na.rm = TRUE)
+      message(sprintf(
+        "  Saved %s (Cell types: %d | Stouffer FDR<0.05: %d | Fisher FDR<0.05: %d)",
+        basename(out_file), nrow(meta_res), n_sig_stouffer, n_sig_fisher))
 
       # Accumulate results
       all_meta_results[[paste(strat, pfx, pred, sep = "|")]] <- meta_res
@@ -269,16 +358,24 @@ if (length(all_meta_results) > 0) {
   data.table::fwrite(grand_combined, grand_file)
   message(sprintf("\nGrand combined CSV saved: %s", grand_file))
 
-  # --- Summary table ---
+  # --- Summary table (both methods) ---
   summary_df <- grand_combined[, .(
-    n_cell_types_tested = .N,
-    n_sig_FDR_0.05      = sum(meta_BH_FDR < 0.05, na.rm = TRUE),
-    n_sig_FDR_0.10      = sum(meta_BH_FDR < 0.10, na.rm = TRUE),
-    n_sig_FDR_0.25      = sum(meta_BH_FDR < 0.25, na.rm = TRUE),
-    n_pos_sig_FDR_0.05  = sum(meta_BH_FDR < 0.05 & weighted_mean_pearson_r > 0, na.rm = TRUE),
-    n_neg_sig_FDR_0.05  = sum(meta_BH_FDR < 0.05 & weighted_mean_pearson_r < 0, na.rm = TRUE),
-    mean_n_datasets     = round(mean(n_datasets), 1),
-    mean_total_samples  = round(mean(total_samples), 0)
+    n_cell_types_tested        = .N,
+    # Stouffer's method summary
+    stouffer_n_sig_FDR_0.05    = sum(stouffer_BH_FDR < 0.05, na.rm = TRUE),
+    stouffer_n_sig_FDR_0.10    = sum(stouffer_BH_FDR < 0.10, na.rm = TRUE),
+    stouffer_n_sig_FDR_0.25    = sum(stouffer_BH_FDR < 0.25, na.rm = TRUE),
+    stouffer_n_pos_FDR_0.05    = sum(stouffer_BH_FDR < 0.05 & weighted_mean_pearson_r > 0, na.rm = TRUE),
+    stouffer_n_neg_FDR_0.05    = sum(stouffer_BH_FDR < 0.05 & weighted_mean_pearson_r < 0, na.rm = TRUE),
+    # Fisher's z-transformation method summary
+    fisher_n_sig_FDR_0.05      = sum(fisher_BH_FDR < 0.05, na.rm = TRUE),
+    fisher_n_sig_FDR_0.10      = sum(fisher_BH_FDR < 0.10, na.rm = TRUE),
+    fisher_n_sig_FDR_0.25      = sum(fisher_BH_FDR < 0.25, na.rm = TRUE),
+    fisher_n_pos_FDR_0.05      = sum(fisher_BH_FDR < 0.05 & fisher_meta_r > 0, na.rm = TRUE),
+    fisher_n_neg_FDR_0.05      = sum(fisher_BH_FDR < 0.05 & fisher_meta_r < 0, na.rm = TRUE),
+    # Shared
+    mean_n_datasets            = round(mean(n_datasets), 1),
+    mean_total_samples         = round(mean(total_samples), 0)
   ), by = .(stratum, prefix, predictor)]
 
   summary_file <- file.path(OUT_ROOT,
